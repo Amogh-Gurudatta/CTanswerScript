@@ -13,16 +13,30 @@ It takes the scattered data on the CodeTantra results page—including your subm
 - **S3 Pre-fetching**: Bypasses CORS restrictions by downloading answer script resources from AWS S3 using the page's native browser context.
 - **Native macOS UI**: The extension popup is styled with a clean Apple-like aesthetic and includes a Light/Dark mode toggle that persists in local storage.
 
+## Supported Browsers
+
+This extension is built using Manifest V3 and works on:
+- **Chromium-based browsers** (Google Chrome, Microsoft Edge, Brave, Arc, Opera, Vivaldi)
+- **Mozilla Firefox** (version 109 and above)
+
 ## Installation
 
-Since this is a developer extension, you'll need to load it manually in Chrome:
+Since this is a developer extension, you'll need to load it manually from the source code.
 
+### For Chromium Browsers (Chrome, Edge, Brave, Arc, etc.)
 1. Clone or download this repository to your local machine.
-2. Open Google Chrome and navigate to `chrome://extensions/`.
-3. Enable **Developer mode** using the toggle in the top right corner.
-4. Click the **Load unpacked** button in the top left.
+2. Open your browser and navigate to the extensions page (e.g., `chrome://extensions/`, `edge://extensions/`, or `brave://extensions/`).
+3. Enable **Developer mode** (usually a toggle in the top right or bottom left corner).
+4. Click the **Load unpacked** button.
 5. Select the `extension/` folder from the directory where you saved this project.
-6. The "CT" (or custom logo) icon should now appear in your browser extensions toolbar!
+6. The icon should now appear in your browser extensions toolbar!
+
+### For Mozilla Firefox
+1. Clone or download this repository to your local machine.
+2. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`.
+3. Click on the **Load Temporary Add-on...** button.
+4. Select the `manifest.json` file inside the `extension/` folder.
+5. The extension will be loaded temporarily (until you restart Firefox).
 
 ## Usage
 
