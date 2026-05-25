@@ -1,0 +1,11 @@
+# Ignore exported PDFs
+CT_Export_*.pdf
+
+# Ignore macOS system files
+.DS_Store
+
+# Ignore raw working files/images that were replaced
+evilct.png
+evilct2.png
+evilct2-fotor-bg-remover-*.png
+page_structure.html

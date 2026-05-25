@@ -1,0 +1,221 @@
+// popup.js — Controls the popup UI state and bridges to background.js
+
+const states = ['invalid', 'ready', 'progress', 'error', 'done'];
+
+function showState(name) {
+  states.forEach(s => {
+    document.getElementById(`state-${s}`).classList.toggle('active', s === name);
+  });
+}
+
+function setProgress(pct, stepText) {
+  document.getElementById('progress-fill').style.width = `${pct}%`;
+  document.getElementById('progress-step').textContent = stepText;
+}
+
+function showError(msg) {
+  document.getElementById('error-msg').textContent = msg;
+  showState('error');
+}
+
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+// ── Inject extraction function into the page (MAIN world) ──
+async function extractFromPage(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: async () => {
+      const ts = window.testSummary;
+      if (!ts) return null;
+
+      const qidVsPageNum = window.qidVsPageNum || {};
+
+      const examData = {
+        examTitle: document.querySelector('.card-header.bg-dark h5 span')?.innerText?.trim() || 'Unknown Exam',
+        studentInfo: (() => {
+          const spans = document.querySelectorAll('.card-header.bg-dark h5 span');
+          return spans[spans.length - 1]?.innerText?.trim() || '';
+        })(),
+        testStartTime: document.getElementById('testStartTime')?.innerText?.trim() || '',
+        marksScored: ts.userMarks,
+        totalMarks: ts.totalMarks,
+        totalTime: ts.totalTime,
+        answerPdfUrl: ts.uploadedFileDetails?.s3path || null,
+        answerPdfBase64: null,
+        qidVsPageNum,
+        sections: []
+      };
+
+      const sectionCards = document.querySelectorAll('.userScore.card.border-info.m-2');
+      for (const sCard of sectionCards) {
+        const sectionName = sCard.querySelector('.userScore.card-header.bg-info span.pull-left')?.innerText?.trim() || '';
+        const badges = sCard.querySelectorAll('.badge.label-info');
+        const marksPerQ = badges[0]?.innerText?.trim() || '';
+        const marksScored = badges[badges.length - 1]?.innerText?.trim() || '';
+
+        const sectionData = { sectionName, marksPerQ, marksScored, questions: [] };
+
+        const qCards = sCard.querySelectorAll('.card.m-1');
+        for (const card of qCards) {
+          const qNumber = card.querySelector('.col-1.col-lg-1.text-left.p-0')?.innerText?.trim();
+          if (!qNumber || !/^\d+$/.test(qNumber)) continue;
+
+          const btn = card.querySelector('[data-qid]');
+          const qid = btn?.getAttribute('data-qid') || '';
+
+          const marksEl = card.querySelectorAll('.col-2.col-lg-2.text-center.p-0 span');
+          const marks = marksEl[marksEl.length - 1]?.innerText?.trim() || '';
+
+          const statusIcon = card.querySelector('.userScore.fa');
+          let status = 'pending';
+          if (statusIcon) {
+            if (statusIcon.classList.contains('fa-check')) status = 'correct';
+            else if (statusIcon.classList.contains('fa-times')) status = 'incorrect';
+            else if (statusIcon.classList.contains('fa-minus')) status = 'skipped';
+          }
+
+          const qBody = card.querySelector('.questionText.ql-editor');
+          const imageUrls = qBody ? [...qBody.querySelectorAll('img')].map(i => i.src) : [];
+          const questionText = qBody?.innerText?.trim() || '';
+
+          const maxMarks = ts.questionPaper?.questionsMap?.[qid]?.marks
+                        || ts.questionPaper?.sectionsMap && Object.values(ts.questionPaper.sectionsMap)
+                             .find(s => s.questionIdsArr?.includes(qid))?.marksPerQuestion
+                        || '?';
+
+          const evaluatorComments = document.getElementById(`comments-${qid}`)?.value?.trim() || '';
+          const answerPages = qidVsPageNum[qid] || [];
+
+          sectionData.questions.push({
+            questionNumber: qNumber, qid, marks, maxMarks,
+            status, imageUrls, questionText, evaluatorComments, answerPages
+          });
+        }
+        examData.sections.push(sectionData);
+      }
+
+      // Pre-fetch the answer PDF from the page context.
+      // Running inside the page means the signed S3 URL is fetched with the
+      // same origin/cookies as the page itself — no CORS issues.
+      const pdfUrl = ts.uploadedFileDetails?.s3path;
+      if (pdfUrl) {
+        try {
+          const res = await fetch(pdfUrl);
+          if (res.ok) {
+            const buf   = await res.arrayBuffer();
+            const u8    = new Uint8Array(buf);
+            let binary  = '';
+            const chunk = 8192;
+            for (let i = 0; i < u8.length; i += chunk) {
+              binary += String.fromCharCode(...u8.subarray(i, Math.min(i + chunk, u8.length)));
+            }
+            examData.answerPdfBase64 = btoa(binary);
+          }
+        } catch (e) {
+          console.warn('CT Exporter: could not pre-fetch answer PDF:', e.message);
+        }
+      }
+
+      return examData;
+    }
+  });
+  return results?.[0]?.result ?? null;
+}
+
+// ── Init popup ──
+(async () => {
+  const tab = await getActiveTab();
+  if (!tab) { showState('invalid'); return; }
+
+  // Quick check: is this a CT results page?
+  let examData = null;
+  try {
+    examData = await extractFromPage(tab.id);
+  } catch (_) { /* scripting permission might not apply on this URL */ }
+
+  if (!examData) {
+    showState('invalid');
+    return;
+  }
+
+  // Populate ready state
+  document.getElementById('popup-exam-title').textContent = examData.examTitle;
+  document.getElementById('popup-student').textContent = examData.studentInfo;
+  showState('ready');
+
+  // ── Generate button ──
+  document.getElementById('btn-generate').addEventListener('click', async () => {
+    showState('progress');
+    setProgress(5, 'Extracting exam data from page…');
+
+    try {
+      // Re-extract fresh (in case page updated)
+      const freshData = await extractFromPage(tab.id);
+      if (!freshData) throw new Error('Could not read exam data. Are you on the results page?');
+      if (!freshData.answerPdfUrl) throw new Error('Answer script PDF URL not found on page.');
+
+      setProgress(20, 'Fetching answer script PDF from page…');
+
+      // Ask background to build the PDF (it fetches S3 resources and runs pdf-lib)
+      chrome.runtime.sendMessage(
+        { type: 'generatePdf', data: freshData },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            showError(chrome.runtime.lastError.message);
+            return;
+          }
+          if (response?.success) {
+            showState('done');
+          } else {
+            showError(response?.error || 'Unknown error during PDF generation.');
+          }
+        }
+      );
+
+      // Simulate progress ticks while background works
+      const steps = [
+        [40,  'Downloading question images…'],
+        [60,  'Building cover & question pages…'],
+        [80,  'Merging answer script pages…'],
+        [93,  'Finalising PDF…'],
+      ];
+      for (const [pct, label] of steps) {
+        await new Promise(r => setTimeout(r, 1800));
+        // Don't overwrite done/error state if already resolved
+        if (document.getElementById('state-progress').classList.contains('active')) {
+          setProgress(pct, label);
+        }
+      }
+
+    } catch (err) {
+      showError(err.message);
+    }
+  });
+
+  // Retry button
+  document.getElementById('btn-retry').addEventListener('click', () => {
+    showState('ready');
+  });
+
+  // Theme Toggle
+  const themeToggle = document.getElementById('theme-toggle');
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  let isDark = localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && prefersDark);
+
+  function applyTheme() {
+    document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    themeToggle.textContent = isDark ? '☀️' : '🌙';
+  }
+
+  applyTheme();
+
+  themeToggle.addEventListener('click', () => {
+    isDark = !isDark;
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    applyTheme();
+  });
+})();
