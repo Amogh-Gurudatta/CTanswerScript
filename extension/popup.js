@@ -160,21 +160,29 @@ async function extractFromPage(tabId) {
 
       setProgress(20, 'Fetching answer script PDF from page…');
 
-      // Ask background to build the PDF (it fetches S3 resources and runs pdf-lib)
-      chrome.runtime.sendMessage(
-        { type: 'generatePdf', data: freshData },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            showError(chrome.runtime.lastError.message);
+      // Ask background to build the PDF (it fetches S3 resources and runs pdf-lib).
+      // Use browser namespace if available (Firefox), fall back to chrome (Chromium).
+      const _rt = typeof browser !== 'undefined' ? browser : chrome;
+      _rt.runtime.sendMessage({ type: 'generatePdf', data: freshData })
+        .then(response => {
+          if (!response?.success) {
+            showError(response?.error || 'Unknown error during PDF generation.');
             return;
           }
-          if (response?.success) {
-            showState('done');
-          } else {
-            showError(response?.error || 'Unknown error during PDF generation.');
-          }
-        }
-      );
+          // Trigger download via Blob URL — works cross-browser without size limits.
+          const bytes = Uint8Array.from(atob(response.pdfBase64), c => c.charCodeAt(0));
+          const blob = new Blob([bytes], { type: 'application/pdf' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = response.filename;
+          a.click();
+          URL.revokeObjectURL(url);
+          showState('done');
+        })
+        .catch(err => {
+          showError(err?.message || 'Unknown error during PDF generation.');
+        });
 
       // Simulate progress ticks while background works
       const steps = [

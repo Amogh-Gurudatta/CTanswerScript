@@ -17,7 +17,7 @@ It takes the scattered data on the CodeTantra results page—including your subm
 
 This extension is built using Manifest V3 and works on:
 - **Chromium-based browsers** (Google Chrome, Microsoft Edge, Brave, Arc, Opera, Vivaldi)
-- **Mozilla Firefox** (version 109 and above)
+- **Mozilla Firefox** (version 128 and above — required for `scripting.executeScript` with `world: 'MAIN'`)
 
 ## Installation
 

@@ -5,8 +5,7 @@
   "description": "Export CodeTantra exam results as a consolidated PDF for LLM analysis",
   "permissions": [
     "activeTab",
-    "scripting",
-    "downloads"
+    "scripting"
   ],
   "host_permissions": [
     "https://*.codetantra.com/*",
@@ -22,5 +21,11 @@
   },
   "background": {
     "service_worker": "background.js"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ct-exporter@kedarmallya",
+      "strict_min_version": "128.0"
+    }
   }
 }

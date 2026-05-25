@@ -326,18 +326,27 @@ async function buildPdf(examData) {
 
 // ── Message Listener ──────────────────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'generatePdf') return false;
+// Use browser namespace if available (Firefox), fall back to chrome (Chromium).
+// browser.runtime.onMessage returns a Promise for async responses, which is
+// more reliable in Firefox than the chrome `return true` pattern.
+const _runtime = typeof browser !== 'undefined' ? browser : chrome;
+
+_runtime.runtime.onMessage.addListener((message, _sender) => {
+  if (message.type !== 'generatePdf') return;
 
   const examData = message.data;
   if (!examData) {
-    sendResponse({ success: false, error: 'No exam data received.' });
-    return false;
+    return Promise.resolve({ success: false, error: 'No exam data received.' });
   }
 
-  buildPdf(examData)
+  const safeName = (examData.examTitle || 'exam_results')
+    .replace(/[^a-z0-9]/gi, '_')
+    .replace(/__+/g, '_')
+    .slice(0, 60);
+  const filename = `CT_Export_${safeName}_${new Date().toISOString().slice(0,10)}.pdf`;
+
+  return buildPdf(examData)
     .then(pdfBytes => {
-      // Convert to base64 for download via data URI
       // Convert to base64 in chunks to avoid stack overflow on large PDFs
       let binary = '';
       const chunk = 8192;
@@ -345,23 +354,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         binary += String.fromCharCode(...pdfBytes.subarray(i, Math.min(i + chunk, pdfBytes.length)));
       }
       const b64 = btoa(binary);
-      const dataUrl = `data:application/pdf;base64,${b64}`;
-
-      // Derive a clean filename from exam title
-      const safeName = (examData.examTitle || 'exam_results')
-        .replace(/[^a-z0-9]/gi, '_')
-        .replace(/__+/g, '_')
-        .slice(0, 60);
-      const filename = `CT_Export_${safeName}_${new Date().toISOString().slice(0,10)}.pdf`;
-
-      chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, () => {
-        sendResponse({ success: true });
-      });
+      // Send bytes back to popup so it can download via Blob URL.
+      // This avoids the Firefox service-worker data-URL download size limit.
+      return { success: true, pdfBase64: b64, filename };
     })
     .catch(err => {
       console.error('PDF generation failed:', err);
-      sendResponse({ success: false, error: err.message });
+      return { success: false, error: err.message };
     });
-
-  return true; // keep message channel open for async response
 });
