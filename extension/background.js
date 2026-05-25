@@ -9,6 +9,11 @@ const { PDFDocument, rgb, StandardFonts } = PDFLib;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// Configuration constants
+const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB limit
+const LARGE_BUFFER_THRESHOLD = 1024 * 1024; // 1MB threshold for base64 encoding strategy
+const PDF_GENERATION_TIMEOUT_MS = 120000; // 2 minutes timeout
+
 // Whitelist of allowed S3 domains
 const ALLOWED_S3_DOMAINS = ['ct-public-bucket.s3.ap-south-1.amazonaws.com'];
 
@@ -23,11 +28,19 @@ function validateS3Url(url) {
 }
 
 async function fetchBytes(url, { timeout = 30000 } = {}) {
-  // Validate S3 URLs for security
-  if (url.includes('s3') || url.includes('.amazonaws.com')) {
-    if (!validateS3Url(url)) {
-      throw new Error('S3 URL origin not whitelisted');
+  // For AWS S3 URLs, apply strict domain validation
+  try {
+    const urlObj = new URL(url);
+    // Check if this looks like an AWS URL by checking hostname pattern
+    if (urlObj.hostname.endsWith('amazonaws.com')) {
+      // Apply strict S3 validation
+      if (!validateS3Url(url)) {
+        throw new Error('S3 URL origin not whitelisted');
+      }
     }
+  } catch (e) {
+    if (e.message === 'S3 URL origin not whitelisted') throw e;
+    // If URL parsing fails, continue with the fetch (non-S3 URL)
   }
   
   const controller = new AbortController();
@@ -74,12 +87,10 @@ async function embedImage(pdfDoc, url) {
   }
 }
 
-const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB limit
-
 // Safely convert binary to base64 without stack overflow
 function binaryToBase64(bytes) {
   // Use ArrayBuffer + btoa for smaller buffers, streaming for large ones
-  if (bytes.length < 1024 * 1024) {
+  if (bytes.length < LARGE_BUFFER_THRESHOLD) {
     // For small buffers, use direct conversion
     let binary = '';
     const chunk = 8192;

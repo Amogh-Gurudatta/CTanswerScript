@@ -1,6 +1,9 @@
 // popup.js — Controls the popup UI state and bridges to background.js
 
 const states = ['invalid', 'ready', 'progress', 'error', 'done'];
+const PDF_GENERATION_TIMEOUT_MS = 120000; // 2 minutes timeout
+const PDF_PREFETCH_TIMEOUT_MS = 15000; // 15 seconds for prefetch
+const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB limit
 
 function showState(name) {
   states.forEach(s => {
@@ -135,7 +138,7 @@ async function extractFromPage(tabId) {
         try {
           // Add timeout to prefetch (15 seconds)
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 15000);
+          const timeoutId = setTimeout(() => controller.abort(), PDF_PREFETCH_TIMEOUT_MS);
           
           const res = await fetch(pdfUrl, { signal: controller.signal });
           clearTimeout(timeoutId);
@@ -145,7 +148,7 @@ async function extractFromPage(tabId) {
             const u8    = new Uint8Array(buf);
             
             // Size check
-            if (u8.length > 50 * 1024 * 1024) {
+            if (u8.length > MAX_PDF_SIZE) {
               console.warn('CT Exporter: PDF too large, skipping prefetch');
             } else {
               let binary  = '';
@@ -227,7 +230,7 @@ async function extractFromPage(tabId) {
       const response = await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('PDF generation timeout (exceeded 2 minutes)'));
-        }, 120000); // 2 minute timeout
+        }, PDF_GENERATION_TIMEOUT_MS);
         
         _rt.runtime.sendMessage({ type: 'generatePdf', data: freshData })
           .then(resp => {
