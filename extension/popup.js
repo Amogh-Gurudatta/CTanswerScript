@@ -229,7 +229,7 @@ async function extractFromPage(tabId) {
       // Use proper async/await to avoid race conditions
       const response = await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
-          reject(new Error('PDF generation timeout (exceeded 2 minutes)'));
+          reject(new Error(`PDF generation timeout (exceeded ${PDF_GENERATION_TIMEOUT_MS / 1000} seconds)`));
         }, PDF_GENERATION_TIMEOUT_MS);
         
         _rt.runtime.sendMessage({ type: 'generatePdf', data: freshData })
