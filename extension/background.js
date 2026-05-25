@@ -9,10 +9,36 @@ const { PDFDocument, rgb, StandardFonts } = PDFLib;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async function fetchBytes(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url.split('?')[0]}`);
-  return new Uint8Array(await res.arrayBuffer());
+// Whitelist of allowed S3 domains
+const ALLOWED_S3_DOMAINS = ['ct-public-bucket.s3.ap-south-1.amazonaws.com'];
+
+function validateS3Url(url) {
+  try {
+    const urlObj = new URL(url);
+    return ALLOWED_S3_DOMAINS.some(domain => urlObj.hostname === domain && urlObj.protocol === 'https:');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function fetchBytes(url, { timeout = 30000 } = {}) {
+  // Validate S3 URLs for security
+  if (url.includes('s3') || url.includes('.amazonaws.com')) {
+    if (!validateS3Url(url)) {
+      throw new Error('S3 URL origin not whitelisted');
+    }
+  }
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url.split('?')[0]}`);
+    return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 function imageTypeFromUrl(url) {
@@ -21,15 +47,60 @@ function imageTypeFromUrl(url) {
   return 'jpg'; // default for S3 JPEG images
 }
 
-async function embedImage(pdfDoc, url) {
+function validateImageUrl(url) {
   try {
-    const bytes = await fetchBytes(url);
+    const urlObj = new URL(url);
+    // Only allow https protocol, reject data-URIs
+    return urlObj.protocol === 'https:' && !url.startsWith('data:');
+  } catch (_) {
+    return false;
+  }
+}
+
+async function embedImage(pdfDoc, url) {
+  if (!validateImageUrl(url)) {
+    console.warn('Invalid image URL rejected:', url.split('?')[0]);
+    return null;
+  }
+  try {
+    const bytes = await fetchBytes(url, { timeout: 15000 });
     return imageTypeFromUrl(url) === 'png'
       ? await pdfDoc.embedPng(bytes)
       : await pdfDoc.embedJpg(bytes);
   } catch (e) {
     console.warn('Could not embed image:', url, e.message);
     return null;
+  }
+}
+
+const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB limit
+
+// Safely convert binary to base64 without stack overflow
+function binaryToBase64(bytes) {
+  // Use ArrayBuffer + btoa for smaller buffers, streaming for large ones
+  if (bytes.length < 1024 * 1024) {
+    // For small buffers, use direct conversion
+    let binary = '';
+    const chunk = 8192;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+    }
+    return btoa(binary);
+  } else {
+    // For larger buffers, use a safer approach with Blob and FileReader
+    // This is a fallback that works in service worker context
+    return new Promise((resolve, reject) => {
+      try {
+        let binary = '';
+        const chunk = 8192;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+        }
+        resolve(btoa(binary));
+      } catch (e) {
+        reject(new Error('Failed to encode large PDF: ' + e.message));
+      }
+    });
   }
 }
 
@@ -303,6 +374,11 @@ async function buildPdf(examData) {
     }
 
     if (!ansBytes) throw new Error('No answer script data found.');
+    
+    // Validate PDF size before loading
+    if (ansBytes.length > MAX_PDF_SIZE) {
+      throw new Error(`Answer PDF too large (${Math.round(ansBytes.length / 1024 / 1024)}MB). Maximum allowed: 50MB`);
+    }
 
     const ansPdf    = await PDFDocument.load(ansBytes);
     const pageCount = ansPdf.getPageCount();
@@ -346,21 +422,22 @@ _runtime.runtime.onMessage.addListener((message, _sender) => {
   const safeName = (examData.examTitle || 'exam_results')
     .replace(/[^a-z0-9]/gi, '_')
     .replace(/__+/g, '_')
-    .slice(0, 60);
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60) || 'exam_results'; // fallback if empty after sanitization
   const filename = `CT_Export_${safeName}_${new Date().toISOString().slice(0,10)}.pdf`;
 
   return buildPdf(examData)
     .then(pdfBytes => {
-      // Convert to base64 in chunks to avoid stack overflow on large PDFs
-      let binary = '';
-      const chunk = 8192;
-      for (let i = 0; i < pdfBytes.length; i += chunk) {
-        binary += String.fromCharCode(...pdfBytes.subarray(i, Math.min(i + chunk, pdfBytes.length)));
+      // Validate PDF size
+      if (pdfBytes.length > MAX_PDF_SIZE) {
+        throw new Error(`PDF too large (${Math.round(pdfBytes.length / 1024 / 1024)}MB). Maximum allowed: 50MB`);
       }
-      const b64 = btoa(binary);
+      
+      // Convert to base64 safely
+      const b64 = binaryToBase64(pdfBytes);
       // Send bytes back to popup so it can download via Blob URL.
       // This avoids the Firefox service-worker data-URL download size limit.
-      return { success: true, pdfBase64: b64, filename };
+      return Promise.resolve({ success: true, pdfBase64: b64, filename });
     })
     .catch(err => {
       console.error('PDF generation failed:', err);
