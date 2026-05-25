@@ -28,20 +28,25 @@ function validateS3Url(url) {
 }
 
 async function fetchBytes(url, { timeout = 30000 } = {}) {
-  // For AWS S3 URLs, apply strict domain validation
+  // For S3 URLs, apply strict domain whitelisting
   try {
     const urlObj = new URL(url);
-    // Check if hostname matches any of our allowed S3 domains
-    if (ALLOWED_S3_DOMAINS.some(domain => urlObj.hostname === domain)) {
-      // This is one of our allowed S3 domains, proceed with fetch
-    } else if (urlObj.hostname && (urlObj.hostname.includes('s3') || urlObj.hostname.endsWith('amazonaws.com'))) {
-      // Looks like an AWS URL but not in our whitelist - reject it
-      throw new Error('S3 URL origin not whitelisted');
+    // Only allow explicitly whitelisted S3 domains
+    // This is a whitelist approach: only allow known-good domains
+    const isAllowedS3Url = ALLOWED_S3_DOMAINS.includes(urlObj.hostname);
+    
+    // If URL appears to be S3-related but not whitelisted, reject it
+    // Check for S3-specific patterns to catch attempted bypass attempts
+    if (!isAllowedS3Url && urlObj.hostname) {
+      // Perform strict validation: only allow if explicitly whitelisted
+      if (urlObj.hostname.startsWith('s3') || 
+          (urlObj.hostname.indexOf('amazonaws') !== -1)) {
+        throw new Error('S3 URL origin not whitelisted');
+      }
     }
-    // Not an AWS URL, proceed with fetch
   } catch (e) {
     if (e.message === 'S3 URL origin not whitelisted') throw e;
-    // If URL parsing fails, continue with the fetch (non-S3 URL)
+    // If URL parsing fails or isn't a full URL, continue with the fetch
   }
   
   const controller = new AbortController();
