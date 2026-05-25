@@ -205,7 +205,25 @@ async function extractFromPage(tabId) {
       // Use browser namespace if available (Firefox), fall back to chrome (Chromium).
       const _rt = typeof browser !== 'undefined' ? browser : chrome;
       
-      // Use proper async/await instead of promise chains to avoid race conditions
+      // Simulate progress ticks while background works
+      const progressPromise = (async () => {
+        const steps = [
+          [40,  'Downloading question images…'],
+          [60,  'Building cover & question pages…'],
+          [80,  'Merging answer script pages…'],
+          [93,  'Finalising PDF…'],
+        ];
+        for (const [pct, label] of steps) {
+          await new Promise(r => setTimeout(r, 1800));
+          // Don't overwrite done/error state if already resolved
+          const progressEl = document.getElementById('state-progress');
+          if (progressEl && progressEl.classList.contains('active')) {
+            setProgress(pct, label);
+          }
+        }
+      })();
+      
+      // Use proper async/await to avoid race conditions
       const response = await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('PDF generation timeout (exceeded 2 minutes)'));
@@ -221,6 +239,9 @@ async function extractFromPage(tabId) {
             reject(err);
           });
       });
+      
+      // Wait for progress simulation to complete (won't prevent early completion)
+      await progressPromise.catch(() => {}); // ignore progress errors
       
       if (!response?.success) {
         throw new Error(response?.error || 'Unknown error during PDF generation.');

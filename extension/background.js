@@ -15,7 +15,8 @@ const ALLOWED_S3_DOMAINS = ['ct-public-bucket.s3.ap-south-1.amazonaws.com'];
 function validateS3Url(url) {
   try {
     const urlObj = new URL(url);
-    return ALLOWED_S3_DOMAINS.some(domain => urlObj.hostname === domain && urlObj.protocol === 'https:');
+    // Strict hostname matching (not substring)
+    return ALLOWED_S3_DOMAINS.includes(urlObj.hostname) && urlObj.protocol === 'https:';
   } catch (_) {
     return false;
   }
@@ -427,17 +428,17 @@ _runtime.runtime.onMessage.addListener((message, _sender) => {
   const filename = `CT_Export_${safeName}_${new Date().toISOString().slice(0,10)}.pdf`;
 
   return buildPdf(examData)
-    .then(pdfBytes => {
+    .then(async pdfBytes => {
       // Validate PDF size
       if (pdfBytes.length > MAX_PDF_SIZE) {
         throw new Error(`PDF too large (${Math.round(pdfBytes.length / 1024 / 1024)}MB). Maximum allowed: 50MB`);
       }
       
-      // Convert to base64 safely
-      const b64 = binaryToBase64(pdfBytes);
+      // Convert to base64 safely (handles large files)
+      const b64 = await binaryToBase64(pdfBytes);
       // Send bytes back to popup so it can download via Blob URL.
       // This avoids the Firefox service-worker data-URL download size limit.
-      return Promise.resolve({ success: true, pdfBase64: b64, filename });
+      return { success: true, pdfBase64: b64, filename };
     })
     .catch(err => {
       console.error('PDF generation failed:', err);
