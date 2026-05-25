@@ -45,8 +45,13 @@ Since this is a developer extension, you'll need to load it manually from the so
 2. **Important**: The signed S3 URLs for your images and PDF expire shortly after the page loads (usually ~15 minutes). For best results, **refresh the results page** immediately before exporting.
 3. Click on the Answer Script Exporter extension icon in your toolbar.
 4. Verify your Exam Name and Student ID in the popup panel.
+
+![Extension popup showing exam details and Export PDF button](docs/screenshot-popup.png)
+
 5. Click **Export PDF**. 
 6. Wait for the progress bar to finish processing. The resulting PDF will automatically download to your computer.
+
+![Exported PDF showing questions, scores, and evaluator comments](docs/screenshot-pdf-output.png)
 
 ## How it Works
 
