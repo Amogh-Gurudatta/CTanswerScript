@@ -1,5 +1,9 @@
-// background.js — Service worker: fetches resources, generates PDF, triggers download
-importScripts('lib/pdf-lib.min.js');
+// background.js — Service worker (Chrome/modern Firefox) or event page (Firefox fallback)
+// In service worker context importScripts is available; in event page context
+// pdf-lib is already loaded as the first entry in background.scripts.
+if (typeof importScripts === 'function') {
+  importScripts('lib/pdf-lib.min.js');
+}
 
 const { PDFDocument, rgb, StandardFonts } = PDFLib;
 
