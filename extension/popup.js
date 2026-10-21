@@ -31,7 +31,10 @@ async function extractFromPage(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
-    func: async () => {
+    // Constants must be passed in: the function is serialised into the page
+    // and cannot see popup-scope variables.
+    args: [PDF_PREFETCH_TIMEOUT_MS, MAX_PDF_SIZE],
+    func: async (PDF_PREFETCH_TIMEOUT_MS, MAX_PDF_SIZE) => {
       // Validate testSummary structure
       const ts = window.testSummary;
       if (!ts || typeof ts !== 'object') return null;
@@ -58,25 +61,116 @@ async function extractFromPage(tabId) {
         sections: []
       };
 
+      // MathJax 3 keeps the original TeX for every typeset formula. Map each
+      // rendered container back to its source so math survives as $...$.
+      const texMap = new Map();
+      try {
+        const items = window.MathJax?.startup?.document?.getMathItemsWithin?.(document.body) || [];
+        for (const item of items) {
+          if (item.typesetRoot && item.inputJax?.name === 'TeX') {
+            texMap.set(item.typesetRoot, item.display ? `$$${item.math}$$` : `$${item.math}$`);
+          }
+        }
+      } catch (_) { /* MathJax missing or different version — fall back to MathML text */ }
+
+      // Convert an element to text lines, preserving paragraph breaks.
+      // Works on hidden (collapsed / modal) elements, unlike innerText.
+      const BLOCK_TAGS = new Set(['P', 'DIV', 'LI', 'TR', 'UL', 'OL', 'TABLE', 'BLOCKQUOTE', 'PRE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+      function toLines(root) {
+        if (!root) return [];
+        let out = '';
+        (function walk(node) {
+          if (node.nodeType === Node.TEXT_NODE) { out += node.nodeValue; return; }
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+          const tag = node.tagName;
+          if (tag === 'MJX-CONTAINER') {
+            const mml = node.querySelector('mjx-assistive-mml, math');
+            out += texMap.get(node) ?? (mml || node).textContent;
+            return;
+          }
+          if (tag === 'SCRIPT') {
+            // MathJax 2 keeps its TeX source in <script type="math/tex">
+            if ((node.type || '').startsWith('math/tex')) out += `$${node.textContent}$`;
+            return;
+          }
+          if (tag === 'STYLE' || node.matches('.MathJax, .MathJax_Display, .MathJax_Preview')) return;
+          if (tag === 'BR') { out += '\n'; return; }
+          const block = BLOCK_TAGS.has(tag);
+          if (block) out += '\n';
+          if (tag === 'LI') {
+            out += node.parentElement?.tagName === 'OL'
+              ? `${[...node.parentElement.children].indexOf(node) + 1}. `
+              : '- ';
+          }
+          for (const child of node.childNodes) walk(child);
+          if (block) out += '\n';
+        })(root);
+        return out.split('\n')
+          .map(l => l.replace(/[\s ]+/g, ' ').trim())
+          .filter(Boolean);
+      }
+
+      // Split question lines into blocks, labelling sub-parts such as
+      // "P1)", "(a)", "b)", "(iii)". Labels typeset as math (e.g.
+      // "$\mathbf{P1})$") are unwrapped first.
+      const MATH_LABEL_RE = /^\$\s*(?:\\[a-zA-Z]+\s*)?\{?\s*([A-Z]?\d{1,2}[a-z]?|[a-h]|[ivx]{1,4})\s*\}?\s*\)\s*\}?\s*\$\s*/;
+      const SUBPART_RE = /^\(?([A-Z]?\d{1,2}[a-z]?|[a-h]|[ivx]{1,4})\)\s*/;
+      function toQuestionBlocks(lines) {
+        const blocks = lines.map(raw => {
+          const line = raw.replace(MATH_LABEL_RE, '$1) ');
+          const m = line.match(SUBPART_RE);
+          return m && line.length > m[0].length
+            ? { label: `${m[1]})`, text: line.slice(m[0].length), raw }
+            : { label: null, text: raw, raw };
+        });
+        // A single labelled line is more likely the question's own number
+        // ("1) Solve ...") than a sub-part.
+        const labelled = blocks.filter(b => b.label).length;
+        return blocks.map(({ label, text, raw }) =>
+          labelled >= 2 ? { label, text } : { label: null, text: raw });
+      }
+
+      // "Show marks break down" modal: one row per rubric criterion.
+      function extractBreakdown(card) {
+        const modal = card.querySelector('.modal[id^="rubricsModal-"]');
+        if (!modal) return [];
+        const heads = [...modal.querySelectorAll('thead th')].map(th => th.textContent.trim().toLowerCase());
+        const colOf = (match, fallback) => {
+          const i = heads.findIndex(match);
+          return i >= 0 ? i : fallback;
+        };
+        const criteriaCol = colOf(h => h.includes('criteria'), 1);
+        const marksCol    = colOf(h => h === 'marks', 2);
+        const commentCol  = colOf(h => h.includes('comment'), 3);
+
+        return [...modal.querySelectorAll('tbody tr')]
+          .map(row => ({
+            criteria: toLines(row.cells[criteriaCol]).join(' '),
+            marks:    row.cells[marksCol]?.textContent?.trim() || '',
+            comment:  toLines(row.cells[commentCol]).join(' '),
+          }))
+          .filter(r => r.criteria || r.marks || r.comment);
+      }
+
       const sectionCards = document.querySelectorAll('.userScore.card.border-info.m-2');
       for (const sCard of sectionCards) {
         const sectionName = sCard.querySelector('.userScore.card-header.bg-info span.pull-left')?.innerText?.trim() || '';
-        const badges = sCard.querySelectorAll('.badge.label-info');
-        const marksPerQ = badges[0]?.innerText?.trim() || '';
-        const marksScored = badges[badges.length - 1]?.innerText?.trim() || '';
 
-        const sectionData = { sectionName, marksPerQ, marksScored, questions: [] };
+        const sectionData = { sectionName, marksPerQ: '', marksScored: '', questions: [] };
 
         const qCards = sCard.querySelectorAll('.card.m-1');
         for (const card of qCards) {
           const qNumber = card.querySelector('.col-1.col-lg-1.text-left.p-0')?.innerText?.trim();
-          if (!qNumber || !/^\d+$/.test(qNumber)) continue;
+          if (!qNumber || !/^\d+/.test(qNumber)) continue;
 
           const btn = card.querySelector('[data-qid]');
           const qid = btn?.getAttribute('data-qid') || '';
 
+          // Marks cell reads either "6.0" or "6.0 / 7.0"
           const marksEl = card.querySelectorAll('.col-2.col-lg-2.text-center.p-0 span');
-          const marks = marksEl[marksEl.length - 1]?.innerText?.trim() || '';
+          const [marksText, maxText] = (marksEl[marksEl.length - 1]?.innerText || '').split('/').map(s => s.trim());
+          const score = ts.scoresMap?.[qid]?.score;
+          const marks = marksText || (typeof score === 'number' ? String(score) : '');
 
           const statusIcon = card.querySelector('.userScore.fa');
           let status = 'pending';
@@ -85,6 +179,7 @@ async function extractFromPage(tabId) {
             else if (statusIcon.classList.contains('fa-times')) status = 'incorrect';
             else if (statusIcon.classList.contains('fa-minus')) status = 'skipped';
           }
+          if (ts.scoresMap?.[qid]?.skipped) status = 'skipped';
 
           const qBody = card.querySelector('.questionText.ql-editor');
           // Validate and filter image URLs
@@ -98,10 +193,10 @@ async function extractFromPage(tabId) {
                 return false;
               }
             }) : [];
-          const questionText = qBody?.innerText?.trim() || '';
+          const questionBlocks = toQuestionBlocks(toLines(qBody));
 
           // Safely extract maxMarks with validation
-          let maxMarks = '?';
+          let maxMarks = maxText || '?';
           if (ts.questionPaper && typeof ts.questionPaper === 'object') {
             const qMap = ts.questionPaper.questionsMap;
             if (qMap && typeof qMap === 'object' && qid in qMap && qMap[qid]?.marks) {
@@ -124,9 +219,15 @@ async function extractFromPage(tabId) {
 
           sectionData.questions.push({
             questionNumber: qNumber, qid, marks, maxMarks,
-            status, imageUrls, questionText, evaluatorComments, answerPages
+            status, imageUrls, questionBlocks, evaluatorComments, answerPages,
+            marksBreakdown: extractBreakdown(card)
           });
         }
+
+        // Section totals are no longer shown on the page; sum them instead
+        const sum = key => sectionData.questions.reduce((acc, q) => acc + (parseFloat(q[key]) || 0), 0);
+        sectionData.marksPerQ = String(sum('maxMarks'));
+        sectionData.marksScored = String(sum('marks'));
         examData.sections.push(sectionData);
       }
 

@@ -115,6 +115,22 @@ function binaryToBase64(bytes) {
   });
 }
 
+// ASCII stand-ins for math symbols that appear when MathJax TeX source is
+// unavailable and the MathML text is used instead.
+const MATH_SYMBOLS = {
+  '\u2032': "'", '\u2033': "''", '\u2192': '->', '\u27f6': '->', '\u21d2': '=>', '\u27f9': '=>',
+  '\u21d4': '<=>', '\u27fa': '<=>', '\u2264': '<=', '\u2265': '>=', '\u2260': '!=', '\u2248': '~=',
+  '\u2208': ' in ', '\u2209': ' not in ', '\u2286': ' subseteq ', '\u2282': ' subset ', '\u2229': ' cap ',
+  '\u222a': ' cup ', '\u2200': 'forall ', '\u2203': 'exists ', '\u2207': 'grad ', '\u2202': 'd',
+  '\u221e': 'inf', '\u2211': 'sum', '\u220f': 'prod', '\u222b': 'int', '\u221a': 'sqrt', '\u2212': '-',
+  '\u2225': '||', '\u2016': '||', '\u22c5': '*', '\u2217': '*', '\u2218': 'o', '\u22a4': 'T',
+  '\u211d': 'R', '\u2115': 'N', '\u2124': 'Z', '\u211a': 'Q', '\u2102': 'C',
+  '\u03b1': 'alpha', '\u03b2': 'beta', '\u03b3': 'gamma', '\u03b4': 'delta', '\u03b5': 'epsilon',
+  '\u03f5': 'epsilon', '\u03b8': 'theta', '\u03bb': 'lambda', '\u03bc': 'mu', '\u03c0': 'pi',
+  '\u03c3': 'sigma', '\u03c4': 'tau', '\u03c6': 'phi', '\u03d5': 'phi', '\u03c9': 'omega',
+  '\u0394': 'Delta', '\u03a3': 'Sigma', '\u03a9': 'Omega',
+};
+
 // Strip characters that WinAnsi (pdf-lib standard fonts) cannot encode.
 // Replaces common Unicode symbols with ASCII stand-ins; removes the rest.
 function toWinAnsi(str) {
@@ -124,8 +140,33 @@ function toWinAnsi(str) {
     .replace(/\u2018|\u2019/g, "'")     // curly single quotes
     .replace(/\u201c|\u201d/g, '"')     // curly double quotes
     .replace(/\u2026/g, '...')           // ellipsis
-    .replace(/[^\x00-\xff]/g, '?')      // everything else outside Latin-1
+    .replace(/[^\x00-\xff]/gu, ch => MATH_SYMBOLS[ch] ?? '?') // everything else outside Latin-1
     .replace(/  +/g, ' ');               // collapse multiple spaces
+}
+
+// Word-wrap text into lines that fit maxWidth. Words wider than a whole
+// line (e.g. long TeX tokens) are hard-broken.
+function wrapText(text, font, size, maxWidth) {
+  const lines = [];
+  let line = '';
+  for (let word of toWinAnsi(text).split(' ')) {
+    while (font.widthOfTextAtSize(word, size) > maxWidth && word.length > 1) {
+      let cut = word.length - 1;
+      while (cut > 1 && font.widthOfTextAtSize(word.slice(0, cut), size) > maxWidth) cut--;
+      if (line) { lines.push(line); line = ''; }
+      lines.push(word.slice(0, cut));
+      word = word.slice(cut);
+    }
+    const test = line ? `${line} ${word}` : word;
+    if (font.widthOfTextAtSize(test, size) > maxWidth && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
 }
 
 // Draw text and return new Y position
@@ -135,21 +176,11 @@ function drawText(page, text, x, y, { size = 11, font, color, maxWidth } = {}) {
   const safe = toWinAnsi(text);
 
   if (maxWidth) {
-    // Simple word-wrap
-    const words = safe.split(' ');
-    let line = '';
     const lh = size * 1.5;
-    for (const word of words) {
-      const test = line ? `${line} ${word}` : word;
-      if (font.widthOfTextAtSize(test, size) > maxWidth && line) {
-        page.drawText(line, { x, y, size, font, color: col });
-        line = word;
-        y -= lh;
-      } else {
-        line = test;
-      }
+    for (const line of wrapText(safe, font, size, maxWidth)) {
+      page.drawText(line, { x, y, size, font, color: col });
+      y -= lh;
     }
-    if (line) { page.drawText(line, { x, y, size, font, color: col }); y -= lh; }
     return y;
   }
 
@@ -279,93 +310,185 @@ async function buildPdf(examData) {
   // Questions are stacked on the same page; a new page is only created when
   // there isn't enough room for the next question block.
 
+  // In this section `y` is the top edge of the next thing to draw; every
+  // element calls ensure() first so long questions flow across pages.
+
   const HEADER_H   = 36;   // question header band height
-  const MIN_BODY_H = 100;  // minimum space for question body content
+  const MIN_BODY_H = 60;   // keep at least this much body below a header
   const MB = 50;           // bottom margin
   let page = null;         // current page reference
-
-  function needNewPage(spaceNeeded) {
-    return !page || y - spaceNeeded < MB;
-  }
 
   function startPage() {
     page = pdfDoc.addPage([W, H]);
     y = H - MT;
   }
 
+  function ensure(spaceNeeded) {
+    if (!page || y - spaceNeeded < MB) startPage();
+  }
+
+  // Wrapped paragraph; returns nothing, advances y
+  function paragraph(text, { x = ML, width = CW, size = 9, f = font, color = C.dark } = {}) {
+    const lh = size * 1.4;
+    for (const line of wrapText(text, f, size, width)) {
+      ensure(lh);
+      page.drawText(line, { x, y: y - size, size, font: f, color });
+      y -= lh;
+    }
+  }
+
+  // Marks breakdown table: # | Marks criteria | Marks | Comments
+  const BD_SIZE = 7.5, BD_LH = 10, BD_PAD = 4;
+  const bdCols = [
+    { title: '#',              width: 18 },
+    { title: 'Marks criteria', width: 236 },
+    { title: 'Marks',          width: 36 },
+    { title: 'Comments',       width: CW - 18 - 236 - 36 },
+  ];
+
+  function breakdownHeader() {
+    const h = BD_LH + BD_PAD * 2;
+    page.drawRectangle({ x: ML, y: y - h, width: CW, height: h, color: C.blue });
+    let cx = ML;
+    for (const col of bdCols) {
+      page.drawText(col.title, { x: cx + BD_PAD, y: y - BD_PAD - BD_SIZE, size: BD_SIZE, font: boldFont, color: C.white });
+      cx += col.width;
+    }
+    y -= h;
+  }
+
+  function breakdownTable(rows) {
+    ensure(14 + (BD_LH + BD_PAD * 2) * 2);
+    const total = rows.reduce((acc, r) => acc + (parseFloat(r.marks) || 0), 0);
+    page.drawText(`Marks Breakdown (${rows.length} criteria, ${total} marks awarded)`, { x: ML, y: y - 8, size: 8, font: boldFont, color: C.blueDark });
+    y -= 14;
+    breakdownHeader();
+
+    rows.forEach((row, i) => {
+      const cells = [String(i + 1), row.criteria, row.marks, row.comment || '-'].map((text, c) =>
+        wrapText(text, c === 2 ? boldFont : font, BD_SIZE, bdCols[c].width - BD_PAD * 2));
+      const rowH = Math.max(...cells.map(l => l.length)) * BD_LH + BD_PAD * 2;
+      if (!page || y - rowH < MB) { startPage(); breakdownHeader(); }
+
+      page.drawRectangle({
+        x: ML, y: y - rowH, width: CW, height: rowH,
+        color: i % 2 === 0 ? C.rowEven : C.white, borderColor: rgb(0.80, 0.82, 0.88), borderWidth: 0.5,
+      });
+      const marksColor = parseFloat(row.marks) > 0 ? C.green : C.red;
+      let cx = ML;
+      cells.forEach((lines, c) => {
+        lines.forEach((line, li) => {
+          page.drawText(line, {
+            x: cx + BD_PAD, y: y - BD_PAD - BD_SIZE - li * BD_LH, size: BD_SIZE,
+            font: c === 2 ? boldFont : font, color: c === 2 ? marksColor : C.dark,
+          });
+        });
+        cx += bdCols[c].width;
+      });
+      y -= rowH;
+    });
+    y -= 8;
+  }
+
+  // Comment box, split across pages if it does not fit
+  function commentBox(text, hasComments) {
+    const bg     = hasComments ? C.amberBg : C.rowEven;
+    const border = hasComments ? C.amber   : rgb(0.80, 0.82, 0.88);
+    const title  = hasComments ? C.amber   : C.light;
+    const LH = 12, TOP = 18, BOTTOM = 8;
+    let lines = wrapText(text, font, 8, CW - 16);
+
+    while (lines.length) {
+      ensure(TOP + LH + BOTTOM);
+      const fit = Math.max(1, Math.floor((y - MB - TOP - BOTTOM) / LH));
+      const chunk = lines.slice(0, fit);
+      lines = lines.slice(fit);
+      const boxH = TOP + chunk.length * LH + BOTTOM;
+
+      page.drawRectangle({ x: ML, y: y - boxH, width: CW, height: boxH, color: bg, borderColor: border, borderWidth: 1 });
+      page.drawRectangle({ x: ML, y: y - boxH, width: 3, height: boxH, color: border });
+      page.drawText('Evaluator Comments', { x: ML + 8, y: y - 11, size: 7, font: boldFont, color: title });
+      chunk.forEach((line, i) => {
+        page.drawText(line, { x: ML + 8, y: y - TOP - 8 - i * LH, size: 8, font, color: C.dark });
+      });
+      y -= boxH;
+    }
+  }
+
   for (const section of examData.sections) {
     for (const q of section.questions) {
-
-      // Pre-calculate comment box height
-      const commentText = q.evaluatorComments || '(No evaluator comments)';
-      const commentLines = Math.ceil(toWinAnsi(commentText).length / 75) + 1;
-      const boxH = Math.max(36, commentLines * 14 + 20);
-
-      // Estimate total block height for this question:
-      //   header(36) + spacing(10) + image-or-text(~80 min) + comment box
-      const estBlockH = HEADER_H + 10 + MIN_BODY_H + boxH + 20;
-
-      if (needNewPage(estBlockH)) startPage();
+      ensure(HEADER_H + MIN_BODY_H);
 
       // ── Question header bar ──
       const isCorrect   = q.status === 'correct';
       const isIncorrect = q.status === 'incorrect';
       const headerBg    = isCorrect ? C.green : isIncorrect ? C.red : C.mid;
-      const statusLabel = isCorrect ? '[OK] Correct' : isIncorrect ? '[X] Incorrect' : '[?] Pending';
+      const statusLabel = isCorrect ? '[OK] Correct' : isIncorrect ? '[X] Incorrect'
+        : q.status === 'skipped' ? '[-] Skipped' : '[?] Pending';
 
       page.drawRectangle({ x: ML - 4, y: y - HEADER_H, width: CW + 8, height: HEADER_H, color: headerBg, borderColor: headerBg, borderWidth: 0 });
       page.drawText(`Q${q.questionNumber}`, { x: ML, y: y - 14, size: 14, font: boldFont, color: C.white });
-      page.drawText(`${section.sectionName}  |  ${statusLabel}`, { x: ML + 30, y: y - 14, size: 9, font, color: rgb(0.9, 0.93, 1) });
-      const marksStr = `${q.marks} / ${q.maxMarks}`;
-      page.drawText(marksStr, { x: ML + CW - 40, y: y - 14, size: 11, font: boldFont, color: C.white });
-      page.drawText('marks', { x: ML + CW - 40, y: y - 28, size: 8, font, color: rgb(0.85, 0.88, 1) });
+      page.drawText(`${section.sectionName}  |  ${statusLabel}`, { x: ML + 34, y: y - 14, size: 9, font, color: rgb(0.9, 0.93, 1) });
+      const marksStr = toWinAnsi(`${q.marks} / ${q.maxMarks}`);
+      const marksW = boldFont.widthOfTextAtSize(marksStr, 11);
+      page.drawText(marksStr, { x: ML + CW - marksW, y: y - 14, size: 11, font: boldFont, color: C.white });
+      page.drawText('marks', { x: ML + CW - font.widthOfTextAtSize('marks', 8), y: y - 28, size: 8, font, color: rgb(0.85, 0.88, 1) });
       y -= HEADER_H + 6;
 
       // Answer script page note
       if (q.answerPages && q.answerPages.length > 0) {
         const pageNums = q.answerPages.map(p => p + 1).join(', ');
-        page.drawText(`Answer script page(s): ${pageNums}`, { x: ML, y, size: 8, font, color: C.blue });
-        y -= 12;
+        paragraph(`Answer script page(s): ${pageNums}`, { size: 8, color: C.blue });
       }
 
-      // ── Question content ──
-      if (q.imageUrls && q.imageUrls.length > 0) {
-        page.drawText('Question:', { x: ML, y, size: 9, font: boldFont, color: C.dark });
-        y -= 12;
+      // ── Question content: text blocks (sub-parts indented), then images ──
+      const blocks = q.questionBlocks || [];
+      const hasImages = q.imageUrls && q.imageUrls.length > 0;
+      if (blocks.length || hasImages) {
+        y -= 2;
+        paragraph('Question:', { f: boldFont });
+        y -= 2;
+      }
 
+      for (const block of blocks) {
+        if (!block.label) {
+          paragraph(block.text);
+          y -= 3;
+          continue;
+        }
+        const labelW = Math.max(26, boldFont.widthOfTextAtSize(toWinAnsi(block.label), 9) + 6);
+        ensure(9 * 1.4);
+        page.drawText(block.label, { x: ML + 8, y: y - 9, size: 9, font: boldFont, color: C.blueDark });
+        paragraph(block.text, { x: ML + 8 + labelW, width: CW - 8 - labelW });
+        y -= 3;
+      }
+
+      if (hasImages) {
         for (const imgUrl of q.imageUrls) {
           const img = await embedImage(pdfDoc, imgUrl);
           if (img) {
             const raw = img.scale(1);
             // Cap image to content width and max 300pt tall — never enlarge
-            const maxW = Math.min(raw.width, CW);
-            const maxH = Math.min(raw.height, 300, Math.max(60, y - MB - boxH - 10));
-            const { w, h } = fitDims(raw.width, raw.height, maxW, maxH);
-            const imgX = ML + (CW - w) / 2;
-            page.drawImage(img, { x: imgX, y: y - h, width: w, height: h });
+            const { w, h } = fitDims(raw.width, raw.height, Math.min(raw.width, CW), Math.min(raw.height, 300));
+            ensure(h);
+            page.drawImage(img, { x: ML + (CW - w) / 2, y: y - h, width: w, height: h });
             y -= h + 6;
           } else {
-            page.drawText('[Image could not be loaded]', { x: ML, y, size: 9, font, color: C.red });
-            y -= 12;
+            paragraph('[Image could not be loaded]', { color: C.red });
           }
         }
-      } else if (q.questionText) {
-        page.drawText('Question:', { x: ML, y, size: 9, font: boldFont, color: C.dark });
-        y -= 12;
-        y = drawText(page, q.questionText, ML, y, { size: 9, font, color: C.dark, maxWidth: CW });
+      }
+
+      // ── Marks breakdown ──
+      if (q.marksBreakdown && q.marksBreakdown.length > 0) {
+        y -= 4;
+        breakdownTable(q.marksBreakdown);
       }
 
       // ── Evaluator comments ──
       y -= 4;
-      const commentBg          = q.evaluatorComments ? C.amberBg  : C.rowEven;
-      const commentBorderColor = q.evaluatorComments ? C.amber    : rgb(0.80, 0.82, 0.88);
-      const commentColor       = q.evaluatorComments ? C.amber    : C.light;
-
-      page.drawRectangle({ x: ML, y: y - boxH, width: CW, height: boxH, color: commentBg, borderColor: commentBorderColor, borderWidth: 1 });
-      page.drawRectangle({ x: ML, y: y - boxH, width: 3, height: boxH, color: commentBorderColor });
-      page.drawText('Evaluator Comments', { x: ML + 8, y: y - 11, size: 7, font: boldFont, color: commentColor });
-      drawText(page, commentText, ML + 8, y - 22, { size: 8, font, color: C.dark, maxWidth: CW - 16 });
-      y -= boxH + 16; // spacing before next question
+      commentBox(q.evaluatorComments || '(No evaluator comments)', !!q.evaluatorComments);
+      y -= 16; // spacing before next question
     }
   }
 
