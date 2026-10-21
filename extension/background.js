@@ -503,6 +503,8 @@ async function buildPdf(examData) {
       const binary = atob(examData.answerPdfBase64);
       ansBytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) ansBytes[i] = binary.charCodeAt(i);
+      // Drop the base64 copy so it can be collected while the PDF is built
+      examData.answerPdfBase64 = null;
     } else if (examData.answerPdfUrl) {
       ansBytes = await fetchBytes(examData.answerPdfUrl);
     }

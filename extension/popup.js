@@ -27,14 +27,17 @@ async function getActiveTab() {
 }
 
 // ── Inject extraction function into the page (MAIN world) ──
-async function extractFromPage(tabId) {
+// prefetchPdf: also download the answer script and return it as base64.
+// Skip it when only checking whether the tab is a results page — the PDF can
+// be tens of MB and would otherwise be fetched on every popup open.
+async function extractFromPage(tabId, { prefetchPdf = true } = {}) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
     // Constants must be passed in: the function is serialised into the page
     // and cannot see popup-scope variables.
-    args: [PDF_PREFETCH_TIMEOUT_MS, MAX_PDF_SIZE],
-    func: async (PDF_PREFETCH_TIMEOUT_MS, MAX_PDF_SIZE) => {
+    args: [PDF_PREFETCH_TIMEOUT_MS, MAX_PDF_SIZE, prefetchPdf],
+    func: async (PDF_PREFETCH_TIMEOUT_MS, MAX_PDF_SIZE, prefetchPdf) => {
       // Validate testSummary structure
       const ts = window.testSummary;
       if (!ts || typeof ts !== 'object') return null;
@@ -235,16 +238,18 @@ async function extractFromPage(tabId) {
       // Running inside the page means the signed S3 URL is fetched with the
       // same origin/cookies as the page itself — no CORS issues.
       const pdfUrl = ts.uploadedFileDetails?.s3path;
-      if (pdfUrl && typeof pdfUrl === 'string') {
+      if (prefetchPdf && pdfUrl && typeof pdfUrl === 'string') {
+        // Timeout covers the body download too, not just the headers
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), PDF_PREFETCH_TIMEOUT_MS);
         try {
-          // Add timeout to prefetch (15 seconds)
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), PDF_PREFETCH_TIMEOUT_MS);
-          
           const res = await fetch(pdfUrl, { signal: controller.signal });
-          clearTimeout(timeoutId);
-          
-          if (res.ok) {
+          const declared = Number(res.headers.get('content-length')) || 0;
+
+          if (res.ok && declared > MAX_PDF_SIZE) {
+            controller.abort();
+            console.warn('CT Exporter: PDF too large, skipping prefetch');
+          } else if (res.ok) {
             const buf   = await res.arrayBuffer();
             const u8    = new Uint8Array(buf);
             
@@ -262,6 +267,8 @@ async function extractFromPage(tabId) {
           }
         } catch (e) {
           console.warn('CT Exporter: could not pre-fetch answer PDF:', e.message);
+        } finally {
+          clearTimeout(timeoutId);
         }
       }
 
@@ -279,7 +286,7 @@ async function extractFromPage(tabId) {
   // Quick check: is this a CT results page?
   let examData = null;
   try {
-    examData = await extractFromPage(tab.id);
+    examData = await extractFromPage(tab.id, { prefetchPdf: false });
   } catch (_) { /* scripting permission might not apply on this URL */ }
 
   if (!examData) {
@@ -352,14 +359,19 @@ async function extractFromPage(tabId) {
       }
       
       // Trigger download via Blob URL — works cross-browser without size limits.
-      const bytes = Uint8Array.from(atob(response.pdfBase64), c => c.charCodeAt(0));
+      // Plain loop: Uint8Array.from(str, fn) allocates a one-char string per
+      // byte, which balloons memory for multi-MB PDFs.
+      const binary = atob(response.pdfBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       const blob = new Blob([bytes], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = response.filename;
       a.click();
-      URL.revokeObjectURL(url);
+      // Revoking synchronously can cancel the download in Firefox
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
       showState('done');
 
     } catch (err) {
